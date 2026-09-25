@@ -11,7 +11,6 @@
 #include "libs/libs.h"
 
 #include <algorithm>
-#include <chrono>
 #include <cstring>
 #include <limits>
 #include <magic_enum.hpp>
@@ -102,12 +101,9 @@ private:
 		uint32_t freq             = 0;
 		Format   format           = Format::Unknown;
 		uint64_t last_output_time = 0;
+		bool     queue_primed     = false;
 		int      channels_num     = 0;
 		int      volume[12]       = {};
-
-		// Deadline for the next blocking write, used to keep the guest's audio thread on
-		// a steady one-buffer-per-period cadence.
-		std::chrono::steady_clock::time_point next_write = {};
 
 		SDL_AudioStream* stream = nullptr;
 	};
@@ -365,42 +361,33 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 	const auto           prepared_size =
 	    BytesPerSample(port->format) * output_channels * port->samples_num;
 
+	uint32_t min_queued_size = 0;
 	if (blocking) {
 		constexpr uint64_t target_latency_us = 40000;
 		const auto buffer_us = port->freq != 0 ? (1000000ULL * port->samples_num) / port->freq : 0;
 		const auto buffers =
 		    buffer_us != 0 ? static_cast<uint32_t>((target_latency_us + buffer_us - 1) / buffer_us)
 		                   : 2u;
-		const auto min_queued_size = prepared_size * std::clamp(buffers, 2u, 16u);
+		min_queued_size           = prepared_size * std::clamp(buffers, 2u, 16u);
 		const auto wait_start      = LibKernel::KernelGetProcessTime();
-		while (SDL_GetAudioStreamQueued(port->stream) > static_cast<int>(min_queued_size)) {
+		auto queued                = SDL_GetAudioStreamQueued(port->stream);
+		if (queued < static_cast<int>(prepared_size)) {
+			port->queue_primed = false;
+		}
+		while (queued > static_cast<int>(min_queued_size)) {
 			if (LibKernel::KernelGetProcessTime() - wait_start > 200000) {
 				SDL_ClearAudioStream(port->stream);
+				port->queue_primed = false;
 				break;
 			}
 			Common::Thread::SleepMicro(1000);
+			queued = SDL_GetAudioStreamQueued(port->stream);
 		}
-
-		// The queue-depth check alone lets the guest emit a burst of buffers and then stall
-		// for the whole cushion, because nothing stops it from refilling the queue as fast
-		// as it can. The long-run rate still comes out right, but the guest's audio thread
-		// sees intervals alternating between ~0 ms and ~44 ms instead of one buffer period,
-		// and mixers that run on a timer cannot track that: the music ends up slow and
-		// warbling. Keep the cushion for latency, but also hold writes to the buffer period
-		// so the cadence stays even. If the stream is running low, write immediately.
-		if (buffer_us != 0) {
-			const auto now = std::chrono::steady_clock::now();
-			if (port->next_write.time_since_epoch().count() == 0 ||
-			    now > port->next_write + std::chrono::microseconds(buffer_us)) {
-				port->next_write = now;
-			}
-			if (SDL_GetAudioStreamQueued(port->stream) > static_cast<int>(prepared_size * 2)) {
-				if (port->next_write > now) {
-					Common::Thread::SleepMicro(static_cast<uint32_t>(
-					    std::chrono::duration_cast<std::chrono::microseconds>(port->next_write - now)
-					        .count()));
-				}
-				port->next_write += std::chrono::microseconds(buffer_us);
+		if (port->queue_primed) {
+			const auto next_time = port->last_output_time + buffer_us;
+			const auto now       = LibKernel::KernelGetProcessTime();
+			if (next_time > now) {
+				Common::Thread::SleepMicro(next_time - now);
 			}
 		}
 	}
@@ -408,6 +395,10 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 	if (!SDL_PutAudioStreamData(port->stream, prepared_data, static_cast<int>(prepared_size))) {
 		LOGF("AudioOut: SDL_PutAudioStreamData failed: %s\n", SDL_GetError());
 		return false;
+	}
+	if (blocking && !port->queue_primed &&
+	    SDL_GetAudioStreamQueued(port->stream) >= static_cast<int>(min_queued_size)) {
+		port->queue_primed = true;
 	}
 
 	return true;

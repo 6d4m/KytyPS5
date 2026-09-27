@@ -843,6 +843,72 @@ void TestDirectMemoryReuseIsZeroFilled() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestPoolExpansionReuseIsZeroFilled() {
+	const char*       test      = "PoolExpansionReuseIsZeroFilled";
+	constexpr uint64_t MapSize  = SceKernelMemoryPoolCommitLen;
+	constexpr uint8_t  Poison   = 0xa5;
+	const auto         direct   = Libs::LibKernel::Memory::KernelGetDirectMemorySize();
+
+	// Take a pool-aligned direct range, poison it and release it, so the expansion below
+	// gets the same physical range back with the previous owner's bytes still in the
+	// backing store.
+	int64_t source_phys = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            SceKernelDirectMemoryStart, direct, MapSize, SceKernelMemoryPoolAlignment,
+	            SceKernelMtypeC, &source_phys),
+	        "KernelAllocateDirectMemory(source)");
+
+	void* source = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &source, MapSize, SceKernelProtCpuRw, 0, source_phys, SceKernelPageSize,
+	            "pool_zero_source"),
+	        "KernelMapNamedDirectMemory(source)");
+	std::memset(source, Poison, MapSize);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(source), MapSize),
+	        "KernelMunmap(source)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelCheckedReleaseDirectMemory(source_phys, MapSize),
+	        "KernelCheckedReleaseDirectMemory(source)");
+
+	// Searching from the released address makes the reuse deterministic: the freed range is
+	// the first one the allocator can hand back.
+	int64_t pool_offset = -1;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMemoryPoolExpand(source_phys, source_phys + MapSize,
+	                                                        MapSize, SceKernelMemoryPoolAlignment,
+	                                                        &pool_offset),
+	        "KernelMemoryPoolExpand");
+	Check(test, pool_offset == source_phys,
+	      "released direct range was not reused, so the zero-fill went untested");
+
+	void* arena = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMemoryPoolReserve(
+	            reinterpret_cast<void*>(0x1000000000ull), SceKernelMemoryPoolReserveLen, 0, 0,
+	            &arena),
+	        "KernelMemoryPoolReserve");
+	const auto base = reinterpret_cast<uint64_t>(arena);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMemoryPoolCommit(arena, MapSize, SceKernelMtypeC,
+	                                                       SceKernelProtCpuRw, 0),
+	        "KernelMemoryPoolCommit");
+	const auto* bytes = reinterpret_cast<const uint8_t*>(arena);
+	Check(test, std::all_of(bytes, bytes + MapSize, [](uint8_t value) { return value == 0; }),
+	      "reused pool expansion exposed stale bytes");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMemoryPoolDecommit(arena, MapSize, 0),
+	        "KernelMemoryPoolDecommit");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelMemoryPoolReserveLen),
+	        "KernelMunmap(pool reserve)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(pool_offset, MapSize),
+	        "KernelReleaseDirectMemory");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestSmallerFlexibleMapReusesReleasedHole() {
 	const char*        test       = "SmallerFlexibleMapReusesReleasedHole";
 	const auto         baseline   = AvailableFlexibleMemory(test);
@@ -3182,6 +3248,7 @@ int main(int argc, char** argv) {
 	RunTest(TestFlexibleNoCoalescePreservesBoundaries);
 	RunTest(TestFlexibleMemoryReuseIsZeroFilled);
 	RunTest(TestDirectMemoryReuseIsZeroFilled);
+	RunTest(TestPoolExpansionReuseIsZeroFilled);
 	RunTest(TestSmallerFlexibleMapReusesReleasedHole);
 	RunTest(TestGuestStackUsesPrivateOwnerMemoryAndCache);
 	RunTest(TestMainEntryUsesGuestStackAndDisablesHostChecks);
